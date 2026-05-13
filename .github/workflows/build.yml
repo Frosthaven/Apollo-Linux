@@ -506,7 +506,10 @@ jobs:
           if [ -n "$LAST_TAG" ] && git rev-parse "$LAST_TAG" >/dev/null 2>&1; then
             COMMITS=$(git log "$LAST_TAG"..HEAD --pretty=format:"- [%h](https://github.com/${{ github.repository }}/commit/%H) %s" --)
           else
-            COMMITS=$(git log --pretty=format:"- [%h](https://github.com/${{ github.repository }}/commit/%H) %s" --)
+            # No prior release - cap to recent commits so we don't dump
+            # thousands of upstream commits into the release body and
+            # blow past the OS argv length limit.
+            COMMITS=$(git log --max-count=50 --pretty=format:"- [%h](https://github.com/${{ github.repository }}/commit/%H) %s" --)
           fi
 
           if [ -z "$COMMITS" ]; then
