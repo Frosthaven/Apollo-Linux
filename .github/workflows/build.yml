@@ -35,6 +35,7 @@ jobs:
             libavutil-dev \
             libswscale-dev \
             libdrm-dev \
+            libgbm-dev \
             libwayland-dev \
             libx11-dev \
             libxrandr-dev \
@@ -222,6 +223,7 @@ jobs:
             libavutil-dev \
             libswscale-dev \
             libdrm-dev \
+            libgbm-dev \
             libwayland-dev \
             libx11-dev \
             libxrandr-dev \
@@ -369,6 +371,7 @@ jobs:
             opus-devel \
             ffmpeg-free-devel \
             libdrm-devel \
+            mesa-libgbm-devel \
             wayland-devel \
             libX11-devel \
             libXrandr-devel \
