@@ -448,24 +448,36 @@ namespace platf {
       bool have_behavior_state = ::access(behavior_state.c_str(), F_OK) == 0;
       if (!have_autotile_state && !have_behavior_state) return true;
 
-      // Restore behavior FIRST so when autotile flips back to its
-      // saved value, per-workspace caches don't get a brief "Global=
-      // true" moment that retiles every existing workspace.
+      // Restore autotile FIRST, while behavior is still Global. The
+      // disable path's "untile every workspace" effect comes from
+      // cosmic-comp's apply_tile_change() iterating every workspace
+      // and calling toggle_tiling — but that loop ONLY runs when
+      // behavior is currently Global (shell/mod.rs apply_tile_change).
+      // So to undo it, we need the autotile write to land while
+      // behavior is still Global, triggering the same broadcast in
+      // the opposite direction. Then we flip behavior back to the
+      // saved value (which, under PerWorkspace, is a no-op for live
+      // tile state).
+      //
+      // Caveat: this restores every workspace to the saved autotile
+      // value uniformly. If the user originally had a mix of per-
+      // workspace tile states under PerWorkspace, the mix is lost
+      // (it was already lost at disable time anyway).
       bool ok = true;
-      if (have_behavior_state) {
-        std::string backed_up = read_small_file(behavior_state);
-        if (backed_up.empty()) backed_up = "PerWorkspace";
-        if (write_small_file(behavior_cfg, backed_up)) {
-          std::remove(behavior_state.c_str());
-        } else {
-          ok = false;
-        }
-      }
       if (have_autotile_state) {
         std::string backed_up = read_small_file(autotile_state);
         if (backed_up.empty()) backed_up = "true";
         if (write_small_file(autotile_cfg, backed_up)) {
           std::remove(autotile_state.c_str());
+        } else {
+          ok = false;
+        }
+      }
+      if (have_behavior_state) {
+        std::string backed_up = read_small_file(behavior_state);
+        if (backed_up.empty()) backed_up = "PerWorkspace";
+        if (write_small_file(behavior_cfg, backed_up)) {
+          std::remove(behavior_state.c_str());
         } else {
           ok = false;
         }
