@@ -28,7 +28,6 @@ jobs:
             cmake \
             ninja-build \
             libssl-dev \
-            libboost-all-dev \
             libpulse-dev \
             libopus-dev \
             libavcodec-dev \
@@ -127,7 +126,6 @@ jobs:
             git \
             cmake \
             ninja \
-            boost \
             openssl \
             opus \
             ffmpeg \
@@ -217,7 +215,6 @@ jobs:
             cmake \
             ninja-build \
             libssl-dev \
-            libboost-all-dev \
             libpulse-dev \
             libopus-dev \
             libavcodec-dev \
