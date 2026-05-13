@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <sys/stat.h>
@@ -31,6 +32,7 @@
 #include "src/config.h"
 #include "src/input.h"
 #include "src/logging.h"
+#include "src/nvhttp.h"
 #include "src/rtsp.h"
 #include "src/platform/common.h"
 #include "src/stream.h"
@@ -796,6 +798,113 @@ namespace platf {
       return true;
     }
 
+    // Parse the current scale of a named output from cosmic-randr's KDL
+    // listing. Returns std::nullopt if the output isn't found or the
+    // scale node can't be located. cosmic-randr emits scale as a child
+    // node inside the output's block, e.g.
+    //   output "DP-3" enabled=#true {
+    //     scale 1.00
+    //     ...
+    //   }
+    std::optional<double> read_evdi_scale(const std::string &output_name) {
+      if (output_name.empty()) return std::nullopt;
+      std::string kdl;
+      if (FILE *p = ::popen("timeout 3 cosmic-randr list --kdl 2>/dev/null", "r")) {
+        std::array<char, 4096> chunk;
+        while (auto n = ::fread(chunk.data(), 1, chunk.size(), p)) {
+          kdl.append(chunk.data(), n);
+        }
+        ::pclose(p);
+      }
+      if (kdl.empty()) return std::nullopt;
+
+      // Find this output's block. Bound the scale search to before the
+      // next `output "` header (or EOF) so we don't grab a neighbour's.
+      std::string header = "output \"" + output_name + "\"";
+      size_t pos = kdl.find(header);
+      if (pos == std::string::npos) return std::nullopt;
+      size_t next_output = kdl.find("\noutput \"", pos + header.size());
+      size_t block_end = (next_output == std::string::npos) ? kdl.size() : next_output;
+      std::string_view block {kdl.data() + pos, block_end - pos};
+
+      // Match the `scale ` child node at start of a line (after indent).
+      // KDL emits two-space indent: "  scale 1.00".
+      size_t s = block.find("\n  scale ");
+      if (s == std::string_view::npos) return std::nullopt;
+      s += 9;  // strlen("\n  scale ")
+      size_t e = block.find_first_of(" \t\r\n", s);
+      if (e == std::string_view::npos) e = block.size();
+      std::string num {block.substr(s, e - s)};
+      try {
+        return std::stod(num);
+      } catch (...) {
+        return std::nullopt;
+      }
+    }
+
+    // Apply a new scale to a named output by mutating the KDL document
+    // and piping the result back through `cosmic-randr kdl` (atomic apply
+    // by cosmic-comp; also persists to ~/.local/state/cosmic-comp/outputs.ron).
+    // Direct writes to outputs.ron are NOT picked up live — cosmic-comp
+    // doesn't watch it — so this round-trip is the only way to live-apply
+    // scale changes.
+    bool apply_evdi_scale(const std::string &output_name, double scale) {
+      if (output_name.empty() || scale <= 0.0) return false;
+      std::string kdl;
+      if (FILE *p = ::popen("timeout 3 cosmic-randr list --kdl 2>/dev/null", "r")) {
+        std::array<char, 4096> chunk;
+        while (auto n = ::fread(chunk.data(), 1, chunk.size(), p)) {
+          kdl.append(chunk.data(), n);
+        }
+        ::pclose(p);
+      }
+      if (kdl.empty()) {
+        BOOST_LOG(warning) << "[evdi_grab] apply_evdi_scale: cosmic-randr list --kdl returned empty";
+        return false;
+      }
+
+      // Locate the `output "NAME"` block and rewrite its `scale` child
+      // node value. Bound the search to before the next `output "` so we
+      // don't accidentally mutate a neighbour output.
+      std::string header = "output \"" + output_name + "\"";
+      size_t out_pos = kdl.find(header);
+      if (out_pos == std::string::npos) {
+        BOOST_LOG(warning) << "[evdi_grab] apply_evdi_scale: output not found in KDL: " << output_name;
+        return false;
+      }
+      size_t next_output = kdl.find("\noutput \"", out_pos + header.size());
+      size_t block_end = (next_output == std::string::npos) ? kdl.size() : next_output;
+      size_t s = kdl.find("\n  scale ", out_pos);
+      if (s == std::string::npos || s >= block_end) {
+        BOOST_LOG(warning) << "[evdi_grab] apply_evdi_scale: scale node not found in output block: " << output_name;
+        return false;
+      }
+      s += 9;  // strlen("\n  scale ")
+      size_t e = kdl.find_first_of(" \t\r\n", s);
+      if (e == std::string::npos || e > block_end) e = block_end;
+      char buf[32];
+      std::snprintf(buf, sizeof(buf), "%g", scale);
+      kdl.replace(s, e - s, buf);
+
+      if (FILE *dump = std::fopen("/tmp/apollo-last-kdl-payload.kdl", "w")) {
+        std::fwrite(kdl.data(), 1, kdl.size(), dump);
+        std::fclose(dump);
+      }
+      FILE *w = ::popen("timeout 5 cosmic-randr kdl 2>/tmp/apollo-last-kdl-stderr.log", "w");
+      if (!w) {
+        BOOST_LOG(warning) << "[evdi_grab] apply_evdi_scale: failed to launch cosmic-randr kdl";
+        return false;
+      }
+      size_t wrote = ::fwrite(kdl.data(), 1, kdl.size(), w);
+      int rc = ::pclose(w);
+      if (rc != 0 || wrote != kdl.size()) {
+        BOOST_LOG(warning) << "[evdi_grab] apply_evdi_scale: cosmic-randr kdl exit=" << rc
+                            << " wrote=" << wrote << "/" << kdl.size();
+        return false;
+      }
+      return true;
+    }
+
     // Health check for cosmic-comp's wlr-output-management responder.
     // The wedges that bite us are characterised by `cosmic-randr list`
     // hanging — backend.lock() is held, the responder can't service
@@ -821,7 +930,8 @@ namespace platf {
           mem_type_(mem_type_e::system),
           delay_(std::chrono::nanoseconds(1'000'000'000ll / std::max(config.framerate, 1))),
           requested_width_(config.width),
-          requested_height_(config.height) {
+          requested_height_(config.height),
+          client_uuid_(config.client_uuid) {
       }
 
       bool init() {
@@ -1016,6 +1126,11 @@ namespace platf {
         struct OutputRestoreGuard {
           bool armed {false};
           bool tiling_was_disabled {false};
+          // Populated from the enclosing evdi_display_t at construction
+          // so the destructor can snapshot per-client EVDI state when the
+          // last session is ending. Both empty == no per-client snapshot.
+          std::string client_uuid;
+          std::string evdi_output_name;
           ~OutputRestoreGuard() {
             BOOST_LOG(info) << "[evdi_grab][debug] ~OutputRestoreGuard fired";
             // Multi-client gate: if other streaming sessions are still
@@ -1051,6 +1166,30 @@ namespace platf {
                               << "so they stay streaming; cleanup will run "
                               << "when the last client disconnects";
               return;
+            }
+
+            // Snapshot the EVDI's current scale and save it on the owning
+            // client's record before the rest of cleanup runs. This is the
+            // teardown half of the per-client scale feature: whatever
+            // scale the user ended the session at (whether they manually
+            // changed it via COSMIC Settings or accepted the default)
+            // becomes that client's saved preference for next time.
+            //
+            // Runs only on the last-session-ending branch (we already
+            // returned above for multi-client overlap), so we attribute
+            // the snapshot exclusively to the last client to disconnect.
+            if (!client_uuid.empty() && !evdi_output_name.empty()) {
+              auto cur = read_evdi_scale(evdi_output_name);
+              if (cur && *cur > 0.0) {
+                if (nvhttp::update_client_evdi_scale(client_uuid, *cur)) {
+                  BOOST_LOG(info) << "[evdi_grab] Saved EVDI scale " << *cur
+                                  << " for client " << client_uuid;
+                } else {
+                  BOOST_LOG(warning) << "[evdi_grab] Could not save EVDI scale "
+                                        "for client " << client_uuid
+                                      << " (client not found in nvhttp state)";
+                }
+              }
             }
 
             // Restore cosmic-comp autotile first — it's a fast file
@@ -1239,6 +1378,8 @@ namespace platf {
           }
         };
         OutputRestoreGuard restore_guard {false};
+        restore_guard.client_uuid = client_uuid_;
+        restore_guard.evdi_output_name = evdi_output_name_;
 
         // We only disable the physical outputs once we've confirmed this
         // capture loop is an actual streaming session (not a transient
@@ -1278,6 +1419,30 @@ namespace platf {
           // Time-only streaming-detection gate.
           if (!disable_check_done && now >= disable_after) {
             disable_check_done = true;
+
+            // Step 2 of the first-connect ordered sequence: set the EVDI
+            // scale for this client. Only runs when this session is the
+            // sole active one (active_session_count == 1 means we're the
+            // first/only client; followers inherit the first client's
+            // scale without override).
+            //
+            // If a saved preference exists for this client, apply it.
+            // Otherwise force 1.0 — we want the starting scale to be
+            // deterministic per-client. Whatever the user changes it to
+            // mid-session becomes their saved preference at teardown.
+            if (!client_uuid_.empty() && !evdi_output_name_.empty() &&
+                stream::session::active_session_count() <= 1) {
+              double saved = nvhttp::get_client_evdi_scale(client_uuid_);
+              double target = (saved > 0.0) ? saved : 1.0;
+              if (apply_evdi_scale(evdi_output_name_, target)) {
+                BOOST_LOG(info) << "[evdi_grab] Applied EVDI scale " << target
+                                << " for client " << client_uuid_
+                                << (saved > 0.0 ? " (saved)" : " (default)");
+              } else {
+                BOOST_LOG(warning) << "[evdi_grab] Failed to apply EVDI scale "
+                                    << target << " for client " << client_uuid_;
+              }
+            }
 
             // Disable cosmic-comp autotile for the duration of this
             // stream regardless of whether we end up disabling
@@ -1578,6 +1743,7 @@ namespace platf {
       int requested_height_ {0};
       std::string evdi_output_name_;          ///< cosmic-comp's name for our EVDI head, for disable on teardown
       std::vector<std::string> disabled_outputs_;  ///< physical outputs we disabled on init, to re-enable on teardown
+      std::string client_uuid_;               ///< paired-cert UUID of the client this session belongs to (for per-client preferences)
     };
 
   }  // namespace

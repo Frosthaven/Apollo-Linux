@@ -107,6 +107,10 @@ namespace crypto {
     bool enable_legacy_ordering;
     bool allow_client_commands;
     bool always_use_virtual_display;
+    // Per-client EVDI display scale (cosmic-comp scale factor like 1.0/1.25/1.5/2.0).
+    // 0 = no remembered value; apollo leaves the virtual display alone on connect
+    // and snapshots whatever scale the client ends the session at on disconnect.
+    double preferred_evdi_scale {0.0};
   };
 
   using p_named_cert_t = std::shared_ptr<named_cert_t>;

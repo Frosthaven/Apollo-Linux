@@ -48,6 +48,11 @@ namespace video {
 
     int encodingFramerate; // Requested display framerate
     bool input_only;
+    // UUID of the paired client this stream serves. Used by the EVDI
+    // capture path to look up per-client display preferences (e.g.
+    // remembered cosmic-comp scale) and to attribute snapshots back
+    // to the right client on session teardown. Empty when unknown.
+    std::string client_uuid;
   };
 
   platf::mem_type_e map_base_dev_type(AVHWDeviceType type);

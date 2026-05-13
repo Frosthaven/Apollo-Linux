@@ -252,6 +252,9 @@ namespace nvhttp {
         named_cert_node["enable_legacy_ordering"] = named_cert_p->enable_legacy_ordering;
         named_cert_node["allow_client_commands"] = named_cert_p->allow_client_commands;
         named_cert_node["always_use_virtual_display"] = named_cert_p->always_use_virtual_display;
+        if (named_cert_p->preferred_evdi_scale > 0.0) {
+          named_cert_node["preferred_evdi_scale"] = named_cert_p->preferred_evdi_scale;
+        }
 
         // Add "do" commands if available.
         if (!named_cert_p->do_cmds.empty()) {
@@ -349,6 +352,7 @@ namespace nvhttp {
         named_cert_p->enable_legacy_ordering = el.value("enable_legacy_ordering", true);
         named_cert_p->allow_client_commands = el.value("allow_client_commands", true);
         named_cert_p->always_use_virtual_display = el.value("always_use_virtual_display", false);
+        named_cert_p->preferred_evdi_scale = el.value("preferred_evdi_scale", 0.0);
         // Load command entries for "do" and "undo" keys.
         named_cert_p->do_cmds = extract_command_entries(el, "do");
         named_cert_p->undo_cmds = extract_command_entries(el, "undo");
@@ -363,6 +367,31 @@ namespace nvhttp {
     }
 
     client_root = client;
+  }
+
+  double get_client_evdi_scale(const std::string& uuid) {
+    for (auto &named_cert : client_root.named_devices) {
+      if (named_cert->uuid == uuid) {
+        return named_cert->preferred_evdi_scale;
+      }
+    }
+    return 0.0;
+  }
+
+  bool update_client_evdi_scale(const std::string& uuid, double scale) {
+    for (auto &named_cert : client_root.named_devices) {
+      if (named_cert->uuid == uuid) {
+        if (named_cert->preferred_evdi_scale == scale) {
+          return true;  // no-op write avoided
+        }
+        named_cert->preferred_evdi_scale = scale;
+        if (!config::sunshine.flags[config::flag::FRESH_STATE]) {
+          save_state();
+        }
+        return true;
+      }
+    }
+    return false;
   }
 
   void add_authorized_client(const p_named_cert_t& named_cert_p) {
