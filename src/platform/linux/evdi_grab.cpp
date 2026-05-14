@@ -1484,6 +1484,22 @@ namespace platf {
                                 << " @ " << requested_width_ << "x" << requested_height_
                                 << (saved > 0.0 ? " (saved)" : " (default)");
                 last_known_scale = target;
+
+                // Settle window between consecutive cosmic-randr kdl applies.
+                // Without it, the very next apply (split-disable of a physical)
+                // can pile onto cosmic-comp's wlr-output-management responder
+                // while it's still digesting our scale change and hang for the
+                // full apollo-side `timeout 5`, which wedges cosmic-comp from
+                // the user's perspective. Mirrors the 500ms gap split-disable
+                // uses between consecutive output flips.
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                if (!cosmic_comp_responsive(1500)) {
+                  BOOST_LOG(warning) << "[evdi_grab] cosmic-comp wlr-output-management "
+                                        "not ready after scale-apply — skipping physical "
+                                        "disable for this session (stream will run with "
+                                        "physicals still on rather than risk a wedge)";
+                  disabled_outputs_.clear();
+                }
               } else {
                 BOOST_LOG(warning) << "[evdi_grab] Failed to apply EVDI scale "
                                     << target << " for client " << client_uuid_;
