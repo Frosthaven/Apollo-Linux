@@ -1,12 +1,12 @@
-# Maintainer: SudoMaker
-# Apollo - Game streaming server with virtual display support
+# Maintainer: Frosthaven <noreply@github.com>
+# Cosmic-Apollo - COSMIC-tuned Apollo game streaming host with virtual display support
 
-pkgname=apollo
+pkgname=cosmic-apollo-linux
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="Self-hosted game streaming server with virtual display support"
+pkgdesc="COSMIC-tuned Apollo game streaming host with virtual display support"
 arch=('x86_64')
-url='https://github.com/ClassicOldSong/Apollo'
+url='https://github.com/Frosthaven/Cosmic-Apollo-Linux'
 license=('GPL-3.0-only')
 install=apollo.install
 
@@ -38,8 +38,13 @@ optdepends=(
   'libva-mesa-driver: AMD GPU encoding support'
 )
 
-provides=('sunshine')
-conflicts=('sunshine')
+# Take over from upstream Apollo (AUR's `apollo` package) and Sunshine.
+# - conflicts: pacman refuses to install either alongside this.
+# - replaces:  pacman offers to swap an existing apollo/sunshine for cosmic-apollo-linux on first install.
+# - provides:  satisfies any other AUR package that declares `apollo` or `sunshine` as a dep.
+provides=('apollo' 'sunshine')
+conflicts=('apollo' 'sunshine')
+replaces=('apollo' 'sunshine')
 
 # Usar o build local já compilado
 source=()

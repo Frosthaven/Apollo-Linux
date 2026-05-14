@@ -39,6 +39,9 @@ Pre-built artifacts (`.deb`, `.rpm`, Arch tarball, `.AppImage`) are on the [Rele
 
 **Option A: install the prebuilt tarball**
 
+> [!IMPORTANT]
+> If you have the AUR's `apollo` package installed, remove it first (`sudo pacman -R apollo`). The tarball drops `/usr/bin/apollo` into place without pacman tracking it; if `apollo` is still in pacman's database, the next `yay -Syu` will silently overwrite your binary with the upstream AUR build.
+
 Download `cosmic-apollo-linux-x86_64.tar.gz` from the [Releases page](https://github.com/Frosthaven/Cosmic-Apollo-Linux/releases) and extract it into `/`:
 
 ```bash
@@ -46,6 +49,8 @@ sudo tar -xzvf cosmic-apollo-linux-x86_64.tar.gz -C /
 sudo setcap cap_sys_admin+p /usr/bin/apollo
 sudo pacman -S --needed evdi-dkms libevdi
 ```
+
+A proper `pacman -U`-installable `.pkg.tar.zst` is a planned follow-up — it will carry `conflicts=('apollo' 'sunshine')` so pacman actively refuses to install the AUR's apollo alongside.
 
 **Option B: build from source**
 
@@ -70,12 +75,14 @@ sudo setcap cap_sys_admin+p /usr/bin/apollo
 
 **Option A: install the prebuilt `.deb`**
 
-Download `cosmic-apollo_*_amd64.deb` from the [Releases page](https://github.com/Frosthaven/Cosmic-Apollo-Linux/releases) and install:
+Download `cosmic-apollo-linux_*_amd64.deb` from the [Releases page](https://github.com/Frosthaven/Cosmic-Apollo-Linux/releases) and install:
 
 ```bash
-sudo apt install ./cosmic-apollo_*_amd64.deb
+sudo apt install ./cosmic-apollo-linux_*_amd64.deb
 sudo apt install evdi-dkms   # not in the .deb's hard Depends; install separately
 ```
+
+The package declares `Conflicts: apollo, sunshine` and `Replaces: apollo, sunshine`, so apt will swap out any upstream Apollo/Sunshine install rather than leaving them side-by-side.
 
 **Option B: build from source**
 
@@ -106,12 +113,14 @@ sudo setcap cap_sys_admin+p /usr/bin/apollo
 
 **Option A: install the prebuilt `.rpm`**
 
-Download `cosmic-apollo-*.x86_64.rpm` from the [Releases page](https://github.com/Frosthaven/Cosmic-Apollo-Linux/releases) and install:
+Download `cosmic-apollo-linux-*.x86_64.rpm` from the [Releases page](https://github.com/Frosthaven/Cosmic-Apollo-Linux/releases) and install:
 
 ```bash
-sudo dnf install ./cosmic-apollo-*.x86_64.rpm
+sudo dnf install ./cosmic-apollo-linux-*.x86_64.rpm
 sudo dnf install evdi   # install separately
 ```
+
+The spec declares `Conflicts: apollo, sunshine` and `Obsoletes: apollo, sunshine`, so dnf will replace any upstream Apollo/Sunshine package rather than leaving them side-by-side.
 
 **Option B: build from source**
 

@@ -190,7 +190,7 @@ jobs:
       - name: Upload Arch Package
         uses: actions/upload-artifact@v4
         with:
-          name: cosmic-apollo-arch-pkg
+          name: cosmic-apollo-linux-arch-pkg
           path: "*.tar.gz"
           retention-days: 30
           if-no-files-found: ignore
@@ -264,7 +264,7 @@ jobs:
       - name: Create DEB Package
         run: |
           VERSION="0.1.0"
-          PKGDIR="cosmic-apollo_${VERSION}_amd64"
+          PKGDIR="cosmic-apollo-linux_${VERSION}_amd64"
 
           mkdir -p ${PKGDIR}/DEBIAN
           mkdir -p ${PKGDIR}/usr/bin
@@ -283,13 +283,16 @@ jobs:
           cp src_assets/linux/misc/icons/*.svg ${PKGDIR}/usr/share/icons/hicolor/scalable/apps/ 2>/dev/null || true
 
           cat > ${PKGDIR}/DEBIAN/control << EOF
-          Package: cosmic-apollo
+          Package: cosmic-apollo-linux
           Version: ${VERSION}
           Section: net
           Priority: optional
           Architecture: amd64
           Depends: libssl3, libpulse0, libopus0, libdrm2, libwayland-client0, libx11-6, libva2, libcurl4, libnotify4, libayatana-appindicator3-1, libevdev2, libcap2
           Recommends: evdi-dkms
+          Conflicts: apollo, sunshine
+          Replaces: apollo, sunshine
+          Provides: apollo, sunshine
           Maintainer: Frosthaven <noreply@github.com>
           Homepage: https://github.com/Frosthaven/Cosmic-Apollo-Linux
           Description: COSMIC-tuned Apollo game streaming host with virtual display support
@@ -345,7 +348,7 @@ jobs:
       - name: Upload DEB Package
         uses: actions/upload-artifact@v4
         with:
-          name: cosmic-apollo-deb
+          name: cosmic-apollo-linux-deb
           path: "*.deb"
           retention-days: 30
           if-no-files-found: ignore
@@ -419,22 +422,28 @@ jobs:
           VERSION="0.1.0"
           mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 
-          mkdir -p cosmic-apollo-${VERSION}/usr/bin
-          mkdir -p cosmic-apollo-${VERSION}/usr/share/apollo
-          cp build/sunshine* cosmic-apollo-${VERSION}/usr/bin/apollo 2>/dev/null || true
-          chmod 755 cosmic-apollo-${VERSION}/usr/bin/apollo 2>/dev/null || true
-          cp -r build/assets/* cosmic-apollo-${VERSION}/usr/share/apollo/ 2>/dev/null || true
-          tar -czvf ~/rpmbuild/SOURCES/cosmic-apollo-${VERSION}.tar.gz cosmic-apollo-${VERSION}
+          mkdir -p cosmic-apollo-linux-${VERSION}/usr/bin
+          mkdir -p cosmic-apollo-linux-${VERSION}/usr/share/apollo
+          cp build/sunshine* cosmic-apollo-linux-${VERSION}/usr/bin/apollo 2>/dev/null || true
+          chmod 755 cosmic-apollo-linux-${VERSION}/usr/bin/apollo 2>/dev/null || true
+          cp -r build/assets/* cosmic-apollo-linux-${VERSION}/usr/share/apollo/ 2>/dev/null || true
+          tar -czvf ~/rpmbuild/SOURCES/cosmic-apollo-linux-${VERSION}.tar.gz cosmic-apollo-linux-${VERSION}
 
-          cat > ~/rpmbuild/SPECS/cosmic-apollo.spec << 'EOF'
-          Name:           cosmic-apollo
+          cat > ~/rpmbuild/SPECS/cosmic-apollo-linux.spec << 'EOF'
+          Name:           cosmic-apollo-linux
           Version:        0.1.0
           Release:        1%{?dist}
           Summary:        COSMIC-tuned Apollo game streaming host with virtual display support
           License:        GPLv3
           URL:            https://github.com/Frosthaven/Cosmic-Apollo-Linux
-          Source0:        cosmic-apollo-%{version}.tar.gz
+          Source0:        cosmic-apollo-linux-%{version}.tar.gz
           Recommends:     evdi
+          Conflicts:      apollo
+          Conflicts:      sunshine
+          Obsoletes:      apollo
+          Obsoletes:      sunshine
+          Provides:       apollo = %{version}
+          Provides:       sunshine = %{version}
 
           %description
           Cosmic-Apollo-Linux is a fork of Apollo-Linux (itself a fork of Sunshine)
@@ -459,13 +468,13 @@ jobs:
           setcap cap_sys_admin+p /usr/bin/apollo || true
           EOF
 
-          rpmbuild -bb ~/rpmbuild/SPECS/cosmic-apollo.spec || echo "RPM build had issues"
+          rpmbuild -bb ~/rpmbuild/SPECS/cosmic-apollo-linux.spec || echo "RPM build had issues"
           cp ~/rpmbuild/RPMS/*/*.rpm . 2>/dev/null || true
 
       - name: Upload RPM
         uses: actions/upload-artifact@v4
         with:
-          name: cosmic-apollo-rpm
+          name: cosmic-apollo-linux-rpm
           path: "*.rpm"
           retention-days: 30
           if-no-files-found: ignore
