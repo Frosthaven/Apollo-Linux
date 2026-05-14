@@ -1463,48 +1463,15 @@ namespace platf {
           if (!disable_check_done && now >= disable_after) {
             disable_check_done = true;
 
-            // Step 2 of the first-connect ordered sequence: set the EVDI
-            // scale for this client. Only runs when this session is the
-            // sole active one (active_session_count == 1 means we're the
-            // first/only client; followers inherit the first client's
-            // scale without override).
-            //
-            // If a saved preference exists for this client, apply it.
-            // Otherwise force 1.0 — we want the starting scale to be
-            // deterministic per-client. Whatever the user changes it to
-            // mid-session becomes their saved preference at teardown.
-            if (!client_uuid_.empty() && !evdi_output_name_.empty() &&
-                stream::session::active_session_count() <= 1) {
-              double saved = nvhttp::get_client_evdi_scale(
-                  client_uuid_, requested_width_, requested_height_);
-              double target = (saved > 0.0) ? saved : 1.0;
-              if (apply_evdi_scale(evdi_output_name_, target)) {
-                BOOST_LOG(info) << "[evdi_grab] Applied EVDI scale " << target
-                                << " for client " << client_uuid_
-                                << " @ " << requested_width_ << "x" << requested_height_
-                                << (saved > 0.0 ? " (saved)" : " (default)");
-                last_known_scale = target;
-
-                // Settle window between consecutive cosmic-randr kdl applies.
-                // Without it, the very next apply (split-disable of a physical)
-                // can pile onto cosmic-comp's wlr-output-management responder
-                // while it's still digesting our scale change and hang for the
-                // full apollo-side `timeout 5`, which wedges cosmic-comp from
-                // the user's perspective. Mirrors the 500ms gap split-disable
-                // uses between consecutive output flips.
-                std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                if (!cosmic_comp_responsive(1500)) {
-                  BOOST_LOG(warning) << "[evdi_grab] cosmic-comp wlr-output-management "
-                                        "not ready after scale-apply — skipping physical "
-                                        "disable for this session (stream will run with "
-                                        "physicals still on rather than risk a wedge)";
-                  disabled_outputs_.clear();
-                }
-              } else {
-                BOOST_LOG(warning) << "[evdi_grab] Failed to apply EVDI scale "
-                                    << target << " for client " << client_uuid_;
-              }
-            }
+            // Per-client EVDI scale-apply moved to *after* the physical
+            // split-disable train (see the detached thread below for the
+            // physicals branch; the no-physicals branch handles it inline
+            // after the EVDI force-enable). Doing scale-apply before
+            // split-disable wedges cosmic-comp's wlr-output-management:
+            // two back-to-back kdl applies (scale + first physical disable)
+            // pile onto a single-threaded responder and the second one
+            // hangs the full 5s timeout. By the end of split-disable the
+            // responder has settled and a single scale-apply lands cleanly.
 
             // Disable cosmic-comp autotile for the duration of this
             // stream regardless of whether we end up disabling
@@ -1570,6 +1537,31 @@ namespace platf {
                                 << "any stale cosmic-comp disabled state "
                                 << "(no physicals being touched)";
                 apply_output_kdl_async({}, {evdi_output_name_});
+
+                // Apply remembered scale AFTER the force-enable kdl
+                // settles. No-physicals branch only has one prior kdl
+                // apply pending (the enable above), so a brief delay
+                // covers it. Detached so the capture loop keeps going.
+                if (!client_uuid_.empty() &&
+                    stream::session::active_session_count() <= 1) {
+                  std::thread([uuid = client_uuid_,
+                               w = requested_width_,
+                               h = requested_height_,
+                               evdi = evdi_output_name_]() {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(800));
+                    double saved = nvhttp::get_client_evdi_scale(uuid, w, h);
+                    double target = (saved > 0.0) ? saved : 1.0;
+                    if (apply_evdi_scale(evdi, target)) {
+                      BOOST_LOG(info) << "[evdi_grab] Applied EVDI scale " << target
+                                      << " for client " << uuid
+                                      << " @ " << w << "x" << h
+                                      << (saved > 0.0 ? " (saved)" : " (default)");
+                    } else {
+                      BOOST_LOG(warning) << "[evdi_grab] Failed to apply EVDI scale "
+                                          << target << " for client " << uuid;
+                    }
+                  }).detach();
+                }
               }
 
               // Intentionally NOT setting armed=true. The destructor is a
@@ -1645,7 +1637,12 @@ namespace platf {
                 // (idempotent: enabled=#true on an enabled output).
                 restore_guard.armed = true;
                 std::thread([targets = disabled_outputs_,
-                             evdi = evdi_output_name_]() mutable {
+                             evdi = evdi_output_name_,
+                             uuid = client_uuid_,
+                             w = requested_width_,
+                             h = requested_height_,
+                             first_session = (stream::session::active_session_count() <= 1)
+                            ]() mutable {
                   // EVDI enable as safety net — should already be
                   // enabled from init()'s pre-check, but the apply is
                   // a no-op in that case.
@@ -1677,6 +1674,27 @@ namespace platf {
                   }
                   BOOST_LOG(info) << "[evdi_grab] Split disable sequence "
                                      "completed cleanly";
+
+                  // Apply remembered EVDI scale now that wlr-output-management
+                  // has finished servicing the disable train. Doing this here
+                  // (instead of before the disables) is the wedge fix:
+                  // back-to-back kdl applies to a contended responder hang for
+                  // 5s and wedge cosmic-comp. By the time we reach this point
+                  // the responder has just settled from the last 500ms gap +
+                  // health check, so a fresh scale-apply lands cleanly.
+                  if (first_session && !uuid.empty() && !evdi.empty()) {
+                    double saved = nvhttp::get_client_evdi_scale(uuid, w, h);
+                    double target = (saved > 0.0) ? saved : 1.0;
+                    if (apply_evdi_scale(evdi, target)) {
+                      BOOST_LOG(info) << "[evdi_grab] Applied EVDI scale " << target
+                                      << " for client " << uuid
+                                      << " @ " << w << "x" << h
+                                      << (saved > 0.0 ? " (saved)" : " (default)");
+                    } else {
+                      BOOST_LOG(warning) << "[evdi_grab] Failed to apply EVDI scale "
+                                          << target << " for client " << uuid;
+                    }
+                  }
                 }).detach();
               }
             }
