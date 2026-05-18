@@ -616,8 +616,102 @@ namespace VDISPLAY {
     return best;
   }
 
-  static unsigned char *generate_edid_for_resolution(uint32_t width, uint32_t height, uint32_t refresh_rate) {
-    static unsigned char edid[256]; // Support for 1 extension block
+  // Emit a 128-byte EDID extension block containing a DisplayID 1.3
+  // section with a single Type I Detailed Timing for the requested
+  // resolution. Used when the requested resolution exceeds the classic
+  // EDID DTD's 12-bit fields (>4095 wide/tall) so the base EDID can't
+  // express it. cosmic-comp parses DisplayID extension blocks (verified
+  // empirically: the user's Samsung LC49G95T's native 5120x1440 mode
+  // exceeds DTD limits and shows up in cosmic-randr's mode list, which
+  // means cosmic-comp picked it up via the monitor's DisplayID
+  // extension), so emitting one for the EVDI should unlock true >4K
+  // streaming. The Type I Timing's preferred bit is set so DisplayID-
+  // aware parsers prefer this mode over the base EDID's capped DTD.
+  static void emit_displayid_extension_block(unsigned char *block128,
+                                              uint32_t width,
+                                              uint32_t height,
+                                              uint32_t refresh_hz) {
+    std::memset(block128, 0, 128);
+
+    // EDID extension wrapper.
+    block128[0] = 0x70;  // DisplayID extension tag
+
+    // DisplayID section header (4 bytes after the wrapper tag).
+    block128[1] = 0x13;  // version 1.3
+    block128[2] = 23;    // bytes in section: one Type I Timing data block
+                         //   (3-byte db header + 20-byte timing payload)
+    block128[3] = 0x03;  // primary use case: Desktop productivity display
+    block128[4] = 0x00;  // extension count
+
+    // Data block header: Type I Detailed Timings (tag 0x03).
+    block128[5] = 0x03;  // data block tag
+    block128[6] = 0x00;  // data block revision
+    block128[7] = 20;    // payload bytes
+
+    // Type I Timing payload (20 bytes at block128[8..27]).
+    // CVT-RB-ish fixed blanking. The virtual display has no physical
+    // pixel-clock constraint, so any internally-consistent timing is
+    // accepted by cosmic-comp.
+    const uint32_t h_blank = 80;
+    const uint32_t h_front = 8;
+    const uint32_t h_sync  = 32;
+    const uint32_t v_blank = 32;
+    const uint32_t v_front = 3;
+    const uint32_t v_sync  = 8;
+    const uint32_t h_total = width + h_blank;
+    const uint32_t v_total = height + v_blank;
+    const uint64_t pixel_clock_hz =
+        static_cast<uint64_t>(h_total) * v_total * refresh_hz;
+    const uint32_t pixel_clock_10khz =
+        static_cast<uint32_t>(pixel_clock_hz / 10000);
+
+    // Pixel clock in 10kHz units, 3 bytes little-endian.
+    block128[8]  = pixel_clock_10khz & 0xFF;
+    block128[9]  = (pixel_clock_10khz >> 8) & 0xFF;
+    block128[10] = (pixel_clock_10khz >> 16) & 0xFF;
+    // Flags: bit 7 = preferred timing.
+    block128[11] = 0x80;
+
+    // All horizontal/vertical fields encoded as (value - 1), 16-bit LE.
+    auto le16m1 = [](unsigned char *out, uint32_t v) {
+      const uint16_t enc = static_cast<uint16_t>(v - 1);
+      out[0] = enc & 0xFF;
+      out[1] = (enc >> 8) & 0xFF;
+    };
+    le16m1(&block128[12], width);   // h_active
+    le16m1(&block128[14], h_blank);
+    le16m1(&block128[16], h_front);
+    le16m1(&block128[18], h_sync);
+    le16m1(&block128[20], height);  // v_active
+    le16m1(&block128[22], v_blank);
+    le16m1(&block128[24], v_front);
+    le16m1(&block128[26], v_sync);
+
+    // DisplayID section checksum at block128[28]: sum of block128[1..28] = 0 mod 256.
+    uint8_t did_sum = 0;
+    for (int i = 1; i <= 27; i++) did_sum += block128[i];
+    block128[28] = static_cast<uint8_t>(0x100 - did_sum);
+
+    // EDID extension checksum at block128[127]: sum of all 128 bytes = 0 mod 256.
+    uint8_t ext_sum = 0;
+    for (int i = 0; i <= 126; i++) ext_sum += block128[i];
+    block128[127] = static_cast<uint8_t>(0x100 - ext_sum);
+  }
+
+  // generate_edid_for_resolution params:
+  //   width / height       — the dims the base EDID's DTD will advertise
+  //                          (already capped by cap_to_displayable at the
+  //                          call sites so it fits the 12-bit DTD field)
+  //   refresh_rate         — refresh in Hz for both the DTD and DisplayID
+  //   original_width /     — the dims the client actually requested. If
+  //   original_height        these exceed width/height (cap fired), a
+  //                          DisplayID extension block is appended that
+  //                          advertises the original mode for DisplayID-
+  //                          aware compositors.
+  static unsigned char *generate_edid_for_resolution(uint32_t width, uint32_t height, uint32_t refresh_rate,
+                                                      uint32_t original_width = 0, uint32_t original_height = 0) {
+    // Up to 2 extension blocks (CEA-861 + DisplayID 1.3) for >4K modes.
+    static unsigned char edid[384];
     memset(edid, 0, sizeof(edid));
 
     // Block 0: Base EDID
@@ -700,9 +794,16 @@ namespace VDISPLAY {
     edid[108] = 0x00; edid[109] = 0x00; edid[110] = 0x00; edid[111] = 0x10; edid[112] = 0x00;
     for (int i = 113; i < 126; i++) edid[i] = 0x20;
 
-    // Extension flag: 1 extension block (for resolutions > 1080p)
+    // Extension count: CEA-861 if >1080p, plus DisplayID if the cap fired.
+    // DisplayID lets cosmic-comp see the original (uncapped) requested mode
+    // for >4K resolutions that the base EDID's classic DTD can't represent.
     bool needs_extension = (width > 1920 || height > 1080);
-    edid[126] = needs_extension ? 0x01 : 0x00;
+    bool needs_displayid = (original_width > 0 && original_height > 0 &&
+                            (original_width != width || original_height != height));
+    uint8_t ext_count = 0;
+    if (needs_extension) ext_count++;
+    if (needs_displayid) ext_count++;
+    edid[126] = ext_count;
 
     // Calculate checksum for block 0
     calculate_edid_checksum(edid, 128);
@@ -743,7 +844,38 @@ namespace VDISPLAY {
       calculate_edid_checksum(&edid[128], 128);
     }
 
+    // Block 2: DisplayID 1.3 extension for >4K modes that don't fit in
+    // the classic DTD. Placed at edid[256..383]. Only emitted when the
+    // caller signalled that the cap fired (original_w/h > width/height).
+    // Slot is fixed at 256 even when no CEA-861 block precedes it; the
+    // EDID extension count (edid[126]) controls how many blocks parsers
+    // walk. We always populate at the same slot for simplicity; if the
+    // base needed no CEA-861 but did need DisplayID, edid[126]=1 and
+    // edid[128..255] is zeroed-but-unused — not ideal, but it never
+    // happens in practice because the >4K cap implies width > 1920.
+    if (needs_displayid) {
+      emit_displayid_extension_block(&edid[256],
+                                      original_width, original_height,
+                                      refresh_rate);
+    }
+
     return edid;
+  }
+
+  // Returns the active byte size of the EDID buffer for the given
+  // resolution combo. Mirrors the size logic the EDID generator uses so
+  // call sites can pass the right size to evdi.connect without rebuilding
+  // the EDID. Inputs are post-cap (what generate_edid_for_resolution sees
+  // as width/height) plus the original requested dims.
+  static unsigned int edid_size_for(uint32_t edid_width, uint32_t edid_height,
+                                     uint32_t original_width,
+                                     uint32_t original_height) {
+    unsigned int size = (edid_width > 1920 || edid_height > 1080) ? 256 : 128;
+    if (original_width > 0 && original_height > 0 &&
+        (original_width != edid_width || original_height != edid_height)) {
+      size = 384;
+    }
+    return size;
   }
 
   // ============================================================================
@@ -934,14 +1066,22 @@ namespace VDISPLAY {
     // requested dims — swscale upscales the captured frame on its way
     // to the encoder, so the client still receives video at the
     // resolution it asked for, just upscaled from the capped capture.
+    //
+    // We also remember the original requested dims so a DisplayID
+    // extension can advertise them — DisplayID-aware compositors
+    // (cosmic-comp included) will see and offer the original mode in
+    // their output mode list. This is a transparent upgrade: parsers
+    // that ignore DisplayID still see the capped DTD as before.
+    const uint32_t original_width = width;
+    const uint32_t original_height = height;
     auto [capped_w, capped_h] = cap_to_displayable(width, height);
     if (capped_w != width || capped_h != height) {
       BOOST_LOG(info) << "[VDISPLAY] Capping requested " << width << "x"
                       << height << " to " << capped_w << "x" << capped_h
-                      << " (classic EDID DTD limit is 4095; DisplayID "
-                         "extension TODO for true >4K support). Encoder "
-                         "still operates at requested dims; capture will "
-                         "be upscaled.";
+                      << " (classic EDID DTD limit is 4095). DisplayID "
+                         "extension block will also advertise the original "
+                         "mode for DisplayID-aware parsers. Encoder still "
+                         "operates at requested dims.";
       width = capped_w;
       height = capped_h;
     }
@@ -953,8 +1093,17 @@ namespace VDISPLAY {
     VirtualDisplayInfo vdinfo;
     vdinfo.name = display_name;
     vdinfo.guid_str = guid_str;
-    vdinfo.width = width;
-    vdinfo.height = height;
+    // When the DisplayID extension is in play (cap fired), cosmic-comp
+    // honors the DisplayID's original mode and sets its EVDI scanout fb
+    // to those dims. The capture buffer must match that scanout — verified
+    // empirically: kernel evdi log showed `Notifying mode changed: 5120
+    // x2880@30` on a 5K request, then grabpix returned -EINVAL for every
+    // call because vdinfo (and thus the buffer) was sized to the capped
+    // 4K. Use the original dims for vdinfo when DisplayID is emitted.
+    const bool using_displayid =
+        (original_width != width || original_height != height);
+    vdinfo.width  = using_displayid ? original_width  : width;
+    vdinfo.height = using_displayid ? original_height : height;
     vdinfo.fps = fps;
     vdinfo.device_index = -1;
     vdinfo.handle = nullptr;
@@ -979,9 +1128,15 @@ namespace VDISPLAY {
           BOOST_LOG(warning) << "[VDISPLAY] No available EVDI device, using passthrough.";
         }
         if (handle) {
-          unsigned char *edid = generate_edid_for_resolution(width, height, fps_hz);
-          unsigned int edid_size = (width > 1920 || height > 1080) ? 256 : 128;
-          BOOST_LOG(info) << "[VDISPLAY] Connecting EDID " << width << "x" << height;
+          unsigned char *edid = generate_edid_for_resolution(width, height, fps_hz,
+                                                              original_width, original_height);
+          unsigned int edid_size = edid_size_for(width, height,
+                                                  original_width, original_height);
+          BOOST_LOG(info) << "[VDISPLAY] Connecting EDID " << width << "x" << height
+                          << " (" << edid_size << " bytes"
+                          << (edid_size == 384 ? ", with DisplayID for original "
+                              + std::to_string(original_width) + "x"
+                              + std::to_string(original_height) : "") << ")";
           evdi.connect(handle, edid, edid_size, 0);
           std::string card_path = "/dev/dri/card" + std::to_string(device);
           shared_evdi.device_index = device;
@@ -999,8 +1154,10 @@ namespace VDISPLAY {
         // unplug before the new plug arrives.
         evdi.disconnect(shared_evdi.handle);
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
-        unsigned char *edid = generate_edid_for_resolution(width, height, fps_hz);
-        unsigned int edid_size = (width > 1920 || height > 1080) ? 256 : 128;
+        unsigned char *edid = generate_edid_for_resolution(width, height, fps_hz,
+                                                            original_width, original_height);
+        unsigned int edid_size = edid_size_for(width, height,
+                                                original_width, original_height);
         BOOST_LOG(info) << "[VDISPLAY] Reconnecting EDID " << width << "x" << height
                         << " (new first session)";
         evdi.connect(shared_evdi.handle, edid, edid_size, 0);
@@ -1094,15 +1251,17 @@ namespace VDISPLAY {
     // Convert from mHz to Hz
     int refresh_hz = refresh_rate / 1000;
 
-    // Same cap as createVirtualDisplay — see comment there.
-    auto [capped_w, capped_h] = cap_to_displayable(
-        static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+    // Same cap as createVirtualDisplay — see comment there. Preserve
+    // the originals for the DisplayID extension.
+    const uint32_t original_width = static_cast<uint32_t>(width);
+    const uint32_t original_height = static_cast<uint32_t>(height);
+    auto [capped_w, capped_h] = cap_to_displayable(original_width, original_height);
     if (static_cast<int>(capped_w) != width ||
         static_cast<int>(capped_h) != height) {
       BOOST_LOG(info) << "[VDISPLAY] Capping requested " << width << "x"
                       << height << " to " << capped_w << "x" << capped_h
-                      << " (EDID DTD limit). Capture buffer will be sized "
-                         "to the cap; encoder context keeps requested dims.";
+                      << " (EDID DTD limit). DisplayID extension block "
+                         "will also advertise the original mode.";
       width = static_cast<int>(capped_w);
       height = static_cast<int>(capped_h);
     }
@@ -1110,18 +1269,29 @@ namespace VDISPLAY {
     BOOST_LOG(info) << "[VDISPLAY] Changing display settings for " << deviceName
                     << " to " << width << "x" << height << "@" << refresh_hz << "Hz";
 
+    // See createVirtualDisplay — when DisplayID is emitted, vdinfo must
+    // carry the ORIGINAL dims so the capture buffer matches cosmic-comp's
+    // scanout fb (which goes to the original mode via DisplayID).
+    const bool using_displayid =
+        (static_cast<uint32_t>(width) != original_width ||
+         static_cast<uint32_t>(height) != original_height);
+    const int vdinfo_w = using_displayid ? static_cast<int>(original_width)  : width;
+    const int vdinfo_h = using_displayid ? static_cast<int>(original_height) : height;
     // Find the virtual display
     for (auto &[guid, vdinfo] : virtual_displays) {
       if (vdinfo.name == deviceName) {
-        vdinfo.width = width;
-        vdinfo.height = height;
+        vdinfo.width = vdinfo_w;
+        vdinfo.height = vdinfo_h;
         vdinfo.fps = refresh_rate;
 
         if (vdinfo.using_evdi && vdinfo.handle) {
           // Reconnect with new EDID for new resolution
           evdi.disconnect(vdinfo.handle);
-          unsigned char *edid = generate_edid_for_resolution(width, height, refresh_hz);
-          unsigned int edid_size = (width > 1920 || height > 1080) ? 256 : 128;
+          unsigned char *edid = generate_edid_for_resolution(width, height, refresh_hz,
+                                                              original_width, original_height);
+          unsigned int edid_size = edid_size_for(static_cast<uint32_t>(width),
+                                                  static_cast<uint32_t>(height),
+                                                  original_width, original_height);
           BOOST_LOG(info) << "[VDISPLAY] Reconnecting with " << edid_size << "-byte EDID for " << width << "x" << height;
           evdi.connect(vdinfo.handle, edid, edid_size, 0);
         }

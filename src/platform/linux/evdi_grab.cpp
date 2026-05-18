@@ -937,14 +937,31 @@ namespace platf {
     // .cpp), retry with the nearest-standard mode that matches what the
     // capped EDID actually advertises. This keeps cosmic-comp's scanout
     // fb in sync with the capture buffer.
-    bool apply_evdi_mode(const std::string &output_name, int width, int height) {
+    // Pass scale > 0.0 to apply mode AND scale atomically in one
+    // cosmic-randr call. Doing them separately races: `cosmic-randr mode`
+    // resets the output's scale to 1.0 as part of the mode change, and
+    // any follow-up scale-apply lands too late — cosmic-comp finishes
+    // the mode change AFTER the scale-apply, snapping scale back to 1.0.
+    // Apollo's live-scale monitor then sees the 1.0 and persists that
+    // as the client's preference, silently corrupting the saved scale
+    // on every reconnect. The combined `mode --scale` invocation
+    // sidesteps the race entirely.
+    bool apply_evdi_mode(const std::string &output_name, int width, int height,
+                          double scale = 0.0) {
       if (output_name.empty() || width <= 0 || height <= 0) return false;
-      auto run = [&output_name](int w, int h) {
-        char cmd[256];
-        std::snprintf(cmd, sizeof(cmd),
-                      "timeout 8 cosmic-randr mode \"%s\" %d %d "
-                      ">/dev/null 2>/tmp/apollo-last-mode-stderr.log",
-                      output_name.c_str(), w, h);
+      auto run = [&output_name, scale](int w, int h) {
+        char cmd[320];
+        if (scale > 0.0) {
+          std::snprintf(cmd, sizeof(cmd),
+                        "timeout 8 cosmic-randr mode --scale %g \"%s\" %d %d "
+                        ">/dev/null 2>/tmp/apollo-last-mode-stderr.log",
+                        scale, output_name.c_str(), w, h);
+        } else {
+          std::snprintf(cmd, sizeof(cmd),
+                        "timeout 8 cosmic-randr mode \"%s\" %d %d "
+                        ">/dev/null 2>/tmp/apollo-last-mode-stderr.log",
+                        output_name.c_str(), w, h);
+        }
         int rc = std::system(cmd);
         return WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
       };
@@ -1669,32 +1686,26 @@ namespace platf {
                                h = requested_height_,
                                evdi = evdi_output_name_]() {
                     std::this_thread::sleep_for(std::chrono::milliseconds(800));
-                    // Force cosmic-comp to size its EVDI scanout fb to match
-                    // what apollo registered. See apply_evdi_mode docs:
-                    // cosmic-comp keeps the old mode on EDID swap, which
-                    // leaves apollo's correctly-sized capture buffer at a
-                    // mismatched dimension and makes grab_pixels return
-                    // -EINVAL on every call (black screen). Doing this in
-                    // the same post-stable thread as the scale-apply avoids
-                    // the probe-phase races that prevent us from doing it
-                    // in init() (see the NOTE there).
-                    if (apply_evdi_mode(evdi, w, h)) {
-                      BOOST_LOG(info) << "[evdi_grab] Applied EVDI mode "
-                                      << w << "x" << h << " to " << evdi;
-                      // Give cosmic-comp a tick to resize the scanout fb
-                      // before the scale apply or capture queries hit it.
-                      std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                    }
+                    // Apply mode AND scale atomically — see apply_evdi_mode
+                    // docs. cosmic-comp resets scale to 1.0 as part of any
+                    // mode change, so a separate apply_evdi_scale after
+                    // apply_evdi_mode races the reset and the saved scale
+                    // gets silently clobbered.
                     double saved = nvhttp::get_client_evdi_scale(uuid, w, h);
                     double target = (saved > 0.0) ? saved : 1.0;
-                    if (apply_evdi_scale(evdi, target)) {
-                      BOOST_LOG(info) << "[evdi_grab] Applied EVDI scale " << target
+                    if (apply_evdi_mode(evdi, w, h, target)) {
+                      BOOST_LOG(info) << "[evdi_grab] Applied EVDI mode "
+                                      << w << "x" << h
+                                      << " + scale " << target
+                                      << " to " << evdi
                                       << " for client " << uuid
-                                      << " @ " << w << "x" << h
                                       << (saved > 0.0 ? " (saved)" : " (default)");
+                      std::this_thread::sleep_for(std::chrono::milliseconds(200));
                     } else {
-                      BOOST_LOG(warning) << "[evdi_grab] Failed to apply EVDI scale "
-                                          << target << " for client " << uuid;
+                      BOOST_LOG(warning) << "[evdi_grab] Failed to apply EVDI "
+                                            "mode+scale " << w << "x" << h
+                                         << " @ " << target << " for client "
+                                         << uuid;
                     }
                   }).detach();
                 }
@@ -1869,30 +1880,26 @@ namespace platf {
                   // the responder has just settled from the last 500ms gap +
                   // health check, so a fresh scale-apply lands cleanly.
                   if (first_session && !uuid.empty() && !evdi.empty()) {
-                    // Force cosmic-comp to size its EVDI scanout fb to
-                    // match what apollo registered (mode-apply before
-                    // scale-apply). See apply_evdi_mode docs: without
-                    // this, switching between resolutions in a single
-                    // apollo lifetime leaves the scanout fb at the
-                    // first-session mode and grab_pixels returns -EINVAL
-                    // on every call (black screen for the client).
-                    if (apply_evdi_mode(evdi, w, h)) {
-                      BOOST_LOG(info) << "[evdi_grab] Applied EVDI mode "
-                                      << w << "x" << h << " to " << evdi;
-                      // Give cosmic-comp a tick to resize the scanout fb
-                      // before the scale apply lands.
-                      std::this_thread::sleep_for(std::chrono::milliseconds(200));
-                    }
+                    // Apply mode AND scale atomically — see apply_evdi_mode
+                    // docs. cosmic-comp resets scale to 1.0 as part of any
+                    // mode change, so a separate apply_evdi_scale after
+                    // apply_evdi_mode races the reset and the saved scale
+                    // gets silently clobbered.
                     double saved = nvhttp::get_client_evdi_scale(uuid, w, h);
                     double target = (saved > 0.0) ? saved : 1.0;
-                    if (apply_evdi_scale(evdi, target)) {
-                      BOOST_LOG(info) << "[evdi_grab] Applied EVDI scale " << target
+                    if (apply_evdi_mode(evdi, w, h, target)) {
+                      BOOST_LOG(info) << "[evdi_grab] Applied EVDI mode "
+                                      << w << "x" << h
+                                      << " + scale " << target
+                                      << " to " << evdi
                                       << " for client " << uuid
-                                      << " @ " << w << "x" << h
                                       << (saved > 0.0 ? " (saved)" : " (default)");
+                      std::this_thread::sleep_for(std::chrono::milliseconds(200));
                     } else {
-                      BOOST_LOG(warning) << "[evdi_grab] Failed to apply EVDI scale "
-                                          << target << " for client " << uuid;
+                      BOOST_LOG(warning) << "[evdi_grab] Failed to apply EVDI "
+                                            "mode+scale " << w << "x" << h
+                                         << " @ " << target << " for client "
+                                         << uuid;
                     }
                   }
                 }).detach();
