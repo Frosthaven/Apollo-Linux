@@ -732,10 +732,19 @@ namespace platf {
       }
 
       // Pipe to cosmic-randr kdl. One IPC request, atomic apply, atomic
-      // rollback on failure inside cosmic-comp. Bumped from 5s → 8s because
-      // 5K mode-sets (e.g. 5120x2880 EVDI) take real wall-clock time and
-      // the original 5s killed legitimately-slow but recoverable applies.
-      FILE *w = ::popen("timeout 8 cosmic-randr kdl 2>/tmp/apollo-last-kdl-stderr.log", "w");
+      // rollback on failure inside cosmic-comp. Bumped from 5s → 8s → 20s
+      // because the first kdl apply after a high-res EVDI hot-plug
+      // triggers cosmic-comp's initialize_output for that surface, which
+      // does the first scanout-fb allocation (~33MB at 4K, ~57MB at 5K),
+      // first render, and an atomic DRM commit that waits for the EVDI
+      // kernel driver's page-flip event. The whole chain can legitimately
+      // take 10–15s the first time the EVDI is set to a new mode. Killing
+      // it with a tight timeout while it's mid-commit leaves cosmic-comp
+      // in a partially-applied state that wedges its wlr-output-management
+      // dispatcher (cosmic-randr list also stops responding). 20s gives
+      // the first commit room to complete; subsequent applies in the same
+      // session land in <1s because the scanout fb is already sized.
+      FILE *w = ::popen("timeout 20 cosmic-randr kdl 2>/tmp/apollo-last-kdl-stderr.log", "w");
       if (!w) {
         BOOST_LOG(warning) << "[evdi_grab] failed to launch cosmic-randr kdl";
         return false;
@@ -872,8 +881,8 @@ namespace platf {
         std::fwrite(kdl.data(), 1, kdl.size(), dump);
         std::fclose(dump);
       }
-      // 8s timeout matches apply_output_kdl_sync — see rationale there.
-      FILE *w = ::popen("timeout 8 cosmic-randr kdl 2>/tmp/apollo-last-kdl-stderr.log", "w");
+      // 20s timeout matches apply_output_kdl_sync — see rationale there.
+      FILE *w = ::popen("timeout 20 cosmic-randr kdl 2>/tmp/apollo-last-kdl-stderr.log", "w");
       if (!w) {
         BOOST_LOG(warning) << "[evdi_grab] apply_evdi_scale: failed to launch cosmic-randr kdl";
         return false;
@@ -954,12 +963,12 @@ namespace platf {
         char cmd[320];
         if (scale > 0.0) {
           std::snprintf(cmd, sizeof(cmd),
-                        "timeout 8 cosmic-randr mode --scale %g \"%s\" %d %d "
+                        "timeout 20 cosmic-randr mode --scale %g \"%s\" %d %d "
                         ">/dev/null 2>/tmp/apollo-last-mode-stderr.log",
                         scale, output_name.c_str(), w, h);
         } else {
           std::snprintf(cmd, sizeof(cmd),
-                        "timeout 8 cosmic-randr mode \"%s\" %d %d "
+                        "timeout 20 cosmic-randr mode \"%s\" %d %d "
                         ">/dev/null 2>/tmp/apollo-last-mode-stderr.log",
                         output_name.c_str(), w, h);
         }

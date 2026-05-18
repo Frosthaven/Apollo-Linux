@@ -459,9 +459,14 @@ jobs:
           cp -r build/assets/. ${STAGE}/usr/share/apollo/
           tar -czvf ~/rpmbuild/SOURCES/${STAGE}.tar.gz ${STAGE}
 
-          cat > ~/rpmbuild/SPECS/cosmic-apollo-linux.spec << 'EOF'
+          # NOTE: the spec heredoc is INTENTIONALLY UNQUOTED so ${VERSION}
+          # (shell var) expands. Everything else inside is rpm macro
+          # syntax (`%{version}`, `%{?dist}`, `%{buildroot}`, etc.) which
+          # has no `$` — safe under unquoted heredoc. If you add a literal
+          # `$` to the spec body, escape it as `\$` or it'll be eaten.
+          cat > ~/rpmbuild/SPECS/cosmic-apollo-linux.spec << EOF
           Name:           cosmic-apollo-linux
-          Version:        0.1.0
+          Version:        ${VERSION}
           Release:        1%{?dist}
           Summary:        COSMIC-tuned Apollo game streaming host with virtual display support
           License:        GPLv3
