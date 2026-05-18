@@ -76,10 +76,21 @@ jobs:
 
       - name: Install to AppDir
         run: |
+          set -e
           DESTDIR=${{github.workspace}}/AppDir cmake --install build
+          # cmake installs the binary as `sunshine` (the cmake target
+          # name). Rename so the AppImage's `Exec=apollo` finds it —
+          # linuxdeploy errors out with "could not find suitable
+          # executable for Exec entry: apollo" otherwise, and silently
+          # swallowing that failure leaves us uploading the wrong file.
+          if [ -f AppDir/usr/bin/sunshine ] && [ ! -f AppDir/usr/bin/apollo ]; then
+            mv AppDir/usr/bin/sunshine AppDir/usr/bin/apollo
+          fi
+          test -x AppDir/usr/bin/apollo
 
       - name: Create AppImage
         run: |
+          set -e
           wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
           chmod +x linuxdeploy-x86_64.AppImage
 
@@ -97,18 +108,29 @@ jobs:
           ./linuxdeploy-x86_64.AppImage \
             --appdir AppDir \
             --output appimage \
-            --desktop-file AppDir/usr/share/applications/apollo.desktop \
-            || echo "AppImage creation had issues, continuing..."
+            --desktop-file AppDir/usr/share/applications/apollo.desktop
 
-          mv Apollo*.AppImage cosmic-apollo-linux-x86_64.AppImage 2>/dev/null || true
+          # linuxdeploy emits Apollo-*-x86_64.AppImage (from the desktop
+          # entry Name). Rename to a stable artifact name; fail the step
+          # if no AppImage was produced rather than uploading the
+          # linuxdeploy helper as the "release" by mistake.
+          shopt -s nullglob
+          built=( Apollo*.AppImage )
+          if [ ${#built[@]} -eq 0 ]; then
+            echo "::error::AppImage build produced no Apollo*.AppImage"
+            exit 1
+          fi
+          mv "${built[0]}" cosmic-apollo-linux-x86_64.AppImage
+          # Drop the helper so the upload glob can't pick it up.
+          rm -f linuxdeploy-x86_64.AppImage
 
       - name: Upload AppImage
         uses: actions/upload-artifact@v4
         with:
           name: cosmic-apollo-linux-appimage
-          path: "*.AppImage"
+          path: cosmic-apollo-linux-x86_64.AppImage
           retention-days: 30
-          if-no-files-found: ignore
+          if-no-files-found: error
 
   # ===========================================
   # Arch Linux Package (tarball)
@@ -419,15 +441,23 @@ jobs:
 
       - name: Create RPM Package
         run: |
+          set -e
           VERSION="0.1.0"
           mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
 
-          mkdir -p cosmic-apollo-linux-${VERSION}/usr/bin
-          mkdir -p cosmic-apollo-linux-${VERSION}/usr/share/apollo
-          cp build/sunshine* cosmic-apollo-linux-${VERSION}/usr/bin/apollo 2>/dev/null || true
-          chmod 755 cosmic-apollo-linux-${VERSION}/usr/bin/apollo 2>/dev/null || true
-          cp -r build/assets/* cosmic-apollo-linux-${VERSION}/usr/share/apollo/ 2>/dev/null || true
-          tar -czvf ~/rpmbuild/SOURCES/cosmic-apollo-linux-${VERSION}.tar.gz cosmic-apollo-linux-${VERSION}
+          # Stage source files for the RPM. The cmake target is named
+          # `sunshine`; rename to `apollo` exactly once with an explicit
+          # cp (the previous `cp build/sunshine* dest_file` could match
+          # multiple files and silently fail because cp needs a directory
+          # destination when given multiple sources). Without a binary in
+          # place the spec's %files line errors with `File not found`.
+          STAGE="cosmic-apollo-linux-${VERSION}"
+          mkdir -p ${STAGE}/usr/bin ${STAGE}/usr/share/apollo
+          test -f build/sunshine
+          cp build/sunshine ${STAGE}/usr/bin/apollo
+          chmod 755 ${STAGE}/usr/bin/apollo
+          cp -r build/assets/. ${STAGE}/usr/share/apollo/
+          tar -czvf ~/rpmbuild/SOURCES/${STAGE}.tar.gz ${STAGE}
 
           cat > ~/rpmbuild/SPECS/cosmic-apollo-linux.spec << 'EOF'
           Name:           cosmic-apollo-linux
@@ -440,8 +470,8 @@ jobs:
           Recommends:     evdi
           Conflicts:      apollo
           Conflicts:      sunshine
-          Obsoletes:      apollo
-          Obsoletes:      sunshine
+          Obsoletes:      apollo < %{version}
+          Obsoletes:      sunshine < %{version}
           Provides:       apollo = %{version}
           Provides:       sunshine = %{version}
 
@@ -457,8 +487,8 @@ jobs:
           %install
           mkdir -p %{buildroot}/usr/bin
           mkdir -p %{buildroot}/usr/share/apollo
-          cp -r usr/bin/* %{buildroot}/usr/bin/ || true
-          cp -r usr/share/apollo/* %{buildroot}/usr/share/apollo/ || true
+          install -Dm0755 usr/bin/apollo %{buildroot}/usr/bin/apollo
+          cp -r usr/share/apollo/. %{buildroot}/usr/share/apollo/
 
           %files
           %attr(755,root,root) /usr/bin/apollo
@@ -468,8 +498,16 @@ jobs:
           setcap cap_sys_admin+p /usr/bin/apollo || true
           EOF
 
-          rpmbuild -bb ~/rpmbuild/SPECS/cosmic-apollo-linux.spec || echo "RPM build had issues"
-          cp ~/rpmbuild/RPMS/*/*.rpm . 2>/dev/null || true
+          rpmbuild -bb ~/rpmbuild/SPECS/cosmic-apollo-linux.spec
+          # Surface the actual .rpm into the workspace; fail loudly if
+          # rpmbuild didn't emit one.
+          shopt -s nullglob
+          rpms=( ~/rpmbuild/RPMS/*/*.rpm )
+          if [ ${#rpms[@]} -eq 0 ]; then
+            echo "::error::rpmbuild produced no .rpm files"
+            exit 1
+          fi
+          cp "${rpms[@]}" .
 
       - name: Upload RPM
         uses: actions/upload-artifact@v4
@@ -477,7 +515,7 @@ jobs:
           name: cosmic-apollo-linux-rpm
           path: "*.rpm"
           retention-days: 30
-          if-no-files-found: ignore
+          if-no-files-found: error
 
   # ===========================================
   # Draft Release (always, manual + tag triggered)
