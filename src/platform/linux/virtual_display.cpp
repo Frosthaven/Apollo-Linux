@@ -12,13 +12,16 @@
 
 // standard includes
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <dlfcn.h>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 // platform includes
@@ -566,6 +569,53 @@ namespace VDISPLAY {
     dtd[17] = 0x1E; // Digital separate sync, positive H and V
   }
 
+  // Cap a requested resolution to one that fits in a classic EDID DTD.
+  //
+  // The 18-byte Detailed Timing Descriptor encodes h_active / v_active in
+  // 12-bit fields (8 bits in one byte + 4 bits packed into another's upper
+  // nibble; see create_detailed_timing_descriptor above). Max representable
+  // value is 4095 — anything larger gets silently masked.
+  //
+  // For 5120x2880, the 0x1400 width truncates to 0x400 (1024) in the EDID.
+  // cosmic-comp parses 1024x2880 from the malformed EDID, sets its scanout
+  // fb to that, and apollo's correctly-sized 5K capture buffer then
+  // mismatches efb->base.width inside the kernel — every grab_pixels
+  // returns -EINVAL and the client sees black.
+  //
+  // Until we add a DisplayID extension block (no 12-bit limit), cap to the
+  // nearest standard mode that fits. Aspect-preserving where possible.
+  // Returns the requested resolution unchanged if it already fits.
+  static std::pair<uint32_t, uint32_t> cap_to_displayable(uint32_t w, uint32_t h) {
+    if (w <= 4095 && h <= 4095) {
+      return {w, h};
+    }
+    // Common standard modes in descending pixel count. Pick the candidate
+    // with the closest aspect ratio to the request.
+    static const std::pair<uint32_t, uint32_t> standards[] = {
+      {3840, 2160},  // 4K UHD 16:9 (~1.778)
+      {3440, 1440},  // UW 21:9 1440p (~2.389)
+      {2560, 1440},  // QHD 16:9 (~1.778)
+      {2560, 1080},  // UW 21:9 1080p (~2.370)
+      {1920, 1200},  // 16:10 1200p (1.600)
+      {1920, 1080},  // FHD 16:9
+      {1680, 1050},  // 16:10
+      {1280, 720},   // 720p 16:9
+    };
+    const double aspect = static_cast<double>(w) / static_cast<double>(h);
+    double best_diff = std::numeric_limits<double>::max();
+    std::pair<uint32_t, uint32_t> best = {3840, 2160};
+    for (const auto &s : standards) {
+      double s_aspect = static_cast<double>(s.first) / static_cast<double>(s.second);
+      double diff = std::abs(s_aspect - aspect);
+      // Strict <: ties go to the first (higher pixel count) candidate.
+      if (diff < best_diff) {
+        best_diff = diff;
+        best = s;
+      }
+    }
+    return best;
+  }
+
   static unsigned char *generate_edid_for_resolution(uint32_t width, uint32_t height, uint32_t refresh_rate) {
     static unsigned char edid[256]; // Support for 1 extension block
     memset(edid, 0, sizeof(edid));
@@ -877,6 +927,25 @@ namespace VDISPLAY {
     // Convert fps from mHz to Hz
     uint32_t fps_hz = fps / 1000;
 
+    // Cap to what apollo's classic-DTD EDID can represent. The cap is
+    // applied to both the EDID generation AND the vdinfo width/height,
+    // so the capture buffer is sized to match cosmic-comp's scanout fb.
+    // The streaming config (and thus encoder ctx) keeps the original
+    // requested dims — swscale upscales the captured frame on its way
+    // to the encoder, so the client still receives video at the
+    // resolution it asked for, just upscaled from the capped capture.
+    auto [capped_w, capped_h] = cap_to_displayable(width, height);
+    if (capped_w != width || capped_h != height) {
+      BOOST_LOG(info) << "[VDISPLAY] Capping requested " << width << "x"
+                      << height << " to " << capped_w << "x" << capped_h
+                      << " (classic EDID DTD limit is 4095; DisplayID "
+                         "extension TODO for true >4K support). Encoder "
+                         "still operates at requested dims; capture will "
+                         "be upscaled.";
+      width = capped_w;
+      height = capped_h;
+    }
+
     BOOST_LOG(info) << "[VDISPLAY] Creating virtual display: " << display_name
                     << " (W: " << width << ", H: " << height << ", FPS: " << fps_hz << ")";
     BOOST_LOG(info) << "[VDISPLAY] Client: " << s_client_name << " (" << s_client_uid << ")";
@@ -1024,6 +1093,19 @@ namespace VDISPLAY {
 
     // Convert from mHz to Hz
     int refresh_hz = refresh_rate / 1000;
+
+    // Same cap as createVirtualDisplay — see comment there.
+    auto [capped_w, capped_h] = cap_to_displayable(
+        static_cast<uint32_t>(width), static_cast<uint32_t>(height));
+    if (static_cast<int>(capped_w) != width ||
+        static_cast<int>(capped_h) != height) {
+      BOOST_LOG(info) << "[VDISPLAY] Capping requested " << width << "x"
+                      << height << " to " << capped_w << "x" << capped_h
+                      << " (EDID DTD limit). Capture buffer will be sized "
+                         "to the cap; encoder context keeps requested dims.";
+      width = static_cast<int>(capped_w);
+      height = static_cast<int>(capped_h);
+    }
 
     BOOST_LOG(info) << "[VDISPLAY] Changing display settings for " << deviceName
                     << " to " << width << "x" << height << "@" << refresh_hz << "Hz";

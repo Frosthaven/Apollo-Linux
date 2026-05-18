@@ -887,6 +887,30 @@ namespace platf {
       return true;
     }
 
+    // Nearest standard mode the EDID's classic DTD can represent. Mirrors
+    // VDISPLAY::cap_to_displayable in virtual_display.cpp — keep these
+    // two lists in sync until we add DisplayID and the cap becomes
+    // unnecessary. Used as the fallback when apply_evdi_mode's requested
+    // dims are rejected with ModeNotFound (because the EDID was capped
+    // here but apollo's `requested_width_/height_` still carries the
+    // original client-requested dims).
+    std::pair<int, int> nearest_standard_mode(int w, int h) {
+      if (w <= 4095 && h <= 4095) return {w, h};
+      static const std::pair<int, int> standards[] = {
+        {3840, 2160}, {3440, 1440}, {2560, 1440}, {2560, 1080},
+        {1920, 1200}, {1920, 1080}, {1680, 1050}, {1280, 720},
+      };
+      const double aspect = static_cast<double>(w) / static_cast<double>(h);
+      double best_diff = 1e9;
+      std::pair<int, int> best = {3840, 2160};
+      for (const auto &s : standards) {
+        double s_aspect = static_cast<double>(s.first) / static_cast<double>(s.second);
+        double diff = std::abs(s_aspect - aspect);
+        if (diff < best_diff) { best_diff = diff; best = s; }
+      }
+      return best;
+    }
+
     // Force cosmic-comp to set a specific mode on a named output. Uses
     // cosmic-randr's CLI `mode` subcommand rather than the kdl mutation
     // path: simpler, no parsing of the live kdl needed, and the CLI
@@ -906,22 +930,44 @@ namespace platf {
     // call (see evdi_painter.c:1144) and the client sees black. Calling
     // `cosmic-randr mode` after each EDID swap forces cosmic-comp to
     // resize the scanout fb to match what apollo asked for.
+    //
+    // Fallback: when the requested mode isn't in the EDID's advertised
+    // list (cosmic-randr returns ModeNotFound; happens for >4K because
+    // VDISPLAY caps the EDID — see cap_to_displayable in virtual_display
+    // .cpp), retry with the nearest-standard mode that matches what the
+    // capped EDID actually advertises. This keeps cosmic-comp's scanout
+    // fb in sync with the capture buffer.
     bool apply_evdi_mode(const std::string &output_name, int width, int height) {
       if (output_name.empty() || width <= 0 || height <= 0) return false;
-      char cmd[256];
-      std::snprintf(cmd, sizeof(cmd),
-                    "timeout 8 cosmic-randr mode \"%s\" %d %d "
-                    ">/dev/null 2>/tmp/apollo-last-mode-stderr.log",
-                    output_name.c_str(), width, height);
-      int rc = std::system(cmd);
-      if (!WIFEXITED(rc) || WEXITSTATUS(rc) != 0) {
+      auto run = [&output_name](int w, int h) {
+        char cmd[256];
+        std::snprintf(cmd, sizeof(cmd),
+                      "timeout 8 cosmic-randr mode \"%s\" %d %d "
+                      ">/dev/null 2>/tmp/apollo-last-mode-stderr.log",
+                      output_name.c_str(), w, h);
+        int rc = std::system(cmd);
+        return WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
+      };
+      if (run(width, height)) return true;
+      auto [fb_w, fb_h] = nearest_standard_mode(width, height);
+      if (fb_w == width && fb_h == height) {
         BOOST_LOG(warning) << "[evdi_grab] apply_evdi_mode: cosmic-randr "
                               "mode failed for " << output_name << " "
-                           << width << "x" << height << " (rc=" << rc
-                           << ", stderr at /tmp/apollo-last-mode-stderr.log)";
+                           << width << "x" << height << " (no fallback to "
+                              "try; check /tmp/apollo-last-mode-stderr.log)";
         return false;
       }
-      return true;
+      BOOST_LOG(info) << "[evdi_grab] apply_evdi_mode: " << width << "x"
+                      << height << " unavailable on " << output_name
+                      << " — falling back to nearest standard "
+                      << fb_w << "x" << fb_h
+                      << " (likely capped by VDISPLAY's EDID for >4K)";
+      if (run(fb_w, fb_h)) return true;
+      BOOST_LOG(warning) << "[evdi_grab] apply_evdi_mode: fallback "
+                         << fb_w << "x" << fb_h << " also failed for "
+                         << output_name
+                         << " (stderr at /tmp/apollo-last-mode-stderr.log)";
+      return false;
     }
 
     // Health check for cosmic-comp's wlr-output-management responder.
